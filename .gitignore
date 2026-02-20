@@ -3,10 +3,14 @@
 .RData
 .Ruserdata
 
-.DS.Store
+# Ignore .DS_Store files (macOS)
+.DS_Store
 
 # Ignore benchmark/output with exceptions (as some files are big)
 benchmark/output/*
 
 # Ignore tikzDictionary
 *tikzDictionary
+
+# Ignore data/
+data/*
