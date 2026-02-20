@@ -1,6 +1,6 @@
 library(SingleCellExperiment)
 library(tidyverse)
-Sys.setenv("BASILISK_EXTERNAL_CONDA"="/g/easybuild/x86_64/Rocky/8/haswell/software/Miniforge3/24.1.2-0")
+# Sys.setenv("BASILISK_EXTERNAL_CONDA"="/g/easybuild/x86_64/Rocky/8/haswell/software/Miniforge3/24.1.2-0")
 
 pa <- argparser::arg_parser("Run linear pretrained model")
 pa <- argparser::add_argument(pa, "--dataset_name", type = "character", help = "The name of the dataset") 
@@ -28,6 +28,10 @@ print(pa)
 set.seed(pa$seed)
 
 out_dir <- file.path(pa$working_dir, "results/", pa$result_id)
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+data_dir <- file.path(pa$working_dir, "results/", pa$test_train_config_id)
+dir.create(data_dir, recursive = TRUE, showWarnings = FALSE)
 # ---------------------------------------
 
 solve_y_axb <- function(Y, A = NULL, B = NULL, A_ridge = 0.01, B_ridge = 0.01){

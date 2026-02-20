@@ -1,8 +1,8 @@
-setwd("/g/huber/users/ahlmanne/projects/perturbation_prediction-benchmark")
+setwd("/Users/QiangChen/Desktop/linear_perturbation_prediction-Paper")
 library(tidyverse)
-library(MyWorkflowManager)
+# library(MyWorkflowManager)
 source("submission/wrap_scripts.R")
-init("/scratch/ahlmanne/perturbation_prediction_benchmark")
+init("/scratch/perturbation_prediction_benchmark")
 
 
 make_single_perturbation_jobs <- function(datasets = c('adamson', 'replogle_k562_essential', 'replogle_rpe1_essential'),

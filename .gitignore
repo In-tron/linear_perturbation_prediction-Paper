@@ -3,6 +3,8 @@
 .RData
 .Ruserdata
 
+.DS.Store
+
 # Ignore benchmark/output with exceptions (as some files are big)
 benchmark/output/*
 

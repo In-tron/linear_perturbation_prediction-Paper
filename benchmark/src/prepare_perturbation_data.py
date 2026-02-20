@@ -10,10 +10,6 @@ import urllib.request
 import zipfile
 import shutil
 
-
-
-
-
 parser = argparse.ArgumentParser(description='Prepare data for combinatorial perturbation prediction')
 parser.add_argument('--dataset_name', dest='dataset_name', action='store', required = True, help='The id of a file in output/results')
 parser.add_argument('--seed', dest = 'seed', action = 'store', help = "The seed of the run", default = 1, type = int)
