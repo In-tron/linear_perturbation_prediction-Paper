@@ -13,13 +13,6 @@ The jobs are defined using my own workflow manager (creatively named [MyWorkflow
 - GEARS can be run both on a regular CPU as well as a GPU.
 
 # Prepare environments
-
-The first time you run `R` (make sure to use version 4.4.1) in the `benchmark` folder, the `.Rprofile` file is loaded and calls `source("renv/activate.R")` which automatically prepares [`renv`](https://rstudio.github.io/renv/articles/renv.html). This process can take a few minutes. Then call 
-```
-renv::restore()
-```
-to install all dependencies.
-
 For the Python environments, I used `conda` from [Miniforge](https://conda-forge.org/download/), which you can recreate with
 ```
  conda env create --file conda_environments/<env>-environment.yml
@@ -46,9 +39,8 @@ If you don't want to reproduce all results, you can also directly call the scrip
 First, we will will setup some folders:
 
 ```shell
-# This could be anywhere
-mkdir /tmp/working_dir
-mkdir /tmp/working_dir/results
+mkdir ouput/working_dir
+mkdir output/working_dir/results
 mkdir -p data/gears_pert_data
 ```
 
@@ -62,90 +54,58 @@ Now we will call `src/prepare_perturbation_data` to download the data and split 
 python3 src/prepare_perturbation_data.py \
   --dataset_name adamson \
   --seed 1 \
-  --working_dir /tmp/working_dir \
+  --working_dir output/working_dir \
   --result_id seed_1_adamson_split
 ```
 
 In the next step we will use the output (`/tmp/working_dir/results/seed_1_adamson_split`) to run the linear model (`src/run_linear_pretrained_model.R`):
 ```shell
-Rscript --no-restore src/run_linear_pretrained_model.R \
+python3 src/run_linear_pretrained_model.py \
     --dataset_name adamson \
     --test_train_config_id seed_1_adamson_split \
     --pca_dim 10 \
     --gene_embedding training_data \
     --pert_embedding training_data \
-    --working_dir /tmp/working_dir \
+    --working_dir output/working_dir \
     --result_id linear_results
 ```
 
-Similarly, we can now run scFoundation (`src/run_scfoundation.py`), GEARS (`src/run_gears.py`), or scGPT (`src/run_scgpt.py`). We can also calculate the ground truth by calling `src/ground_truth_combinatorial_prediction`. Remember to load the right conda environment each time before executing the script.
+Similarly, we can now run mean (`src/run_mean_prediction.py`), scFoundation (`src/run_scfoundation.py`), GEARS (`src/run_gears.py`), or scGPT (`src/run_scgpt.py`). We can also calculate the ground truth by calling `src/ground_truth_combinatorial_prediction`. Remember to load the right conda environment each time before executing the script.
 
 ```shell
-conda activate gears_env2
+python3 src/run_mean_prediction.py \
+    --dataset_name adamson \
+    --test_train_config_id seed_1_adamson_split \
+    --working_dir output/working_dir \
+    --result_id mean_results
+
 python3 src/run_ground_truth_for_combinatorial_perturbations.py \
     --dataset_name adamson \
     --test_train_config_id seed_1_adamson_split \
-    --working_dir /tmp/working_dir \
+    --working_dir output/working_dir \
     --result_id ground_truth_results
 
-conda activate flashattn_env    
+ 
 python3 src/run_scgpt.py \
     --dataset_name adamson \
     --test_train_config_id seed_1_adamson_split \
     --working_dir /tmp/working_dir \
     --result_id scgpt_results    
 
-conda activate gears_env2
+
 python3 src/run_gears.py \
     --dataset_name adamson \
     --test_train_config_id seed_1_adamson_split \
-    --working_dir working_dir \
+    --working_dir output/working_dir \
     --result_id gears_results
 ```
 
-Each script produces a JSON file with the predictions of the gene expression for each perturbation and one JSON file listing the genes (as the order might differ). You can load the results with R and plot them:
+Each script produces a JSON file with the predictions of the gene expression for each perturbation and one JSON file listing the genes (as the order might differ). You can load the results and plot them:
 
-```r
-library(tidyverse)
-
-test_train <- rjson::fromJSON(file = "/tmp/working_dir/results/seed_1_adamson_split") %>%
-  enframe(name = "train", value = "perturbation") %>%
-  unnest(perturbation)
-
-load_results <- function(path){
-  preds <- rjson::fromJSON(file = file.path(path, "all_predictions.json"))
-  names <- rjson::fromJSON(file = file.path(path, "gene_names.json"))
-  tibble(perturbation = names(preds), prediction = unname(preds), gene = list(names)) %>%
-    unnest(c(prediction, gene)) %>%
-    mutate(perturbation = map_chr(str_split(perturbation, pattern = "[+_]", n = 2), \(x) {
-      tmp <- if(all(x == "ctrl" | x == "")) "ctrl" else if(length(x) == 2) x else c(x, "ctrl")
-      paste0(tmp, collapse = "+")
-    }))
-}
-
-ground_truth <- load_results("/tmp/working_dir/results/ground_truth/") %>%
-  rename(truth = prediction)
-preds <- bind_rows(linear = load_results("/tmp/working_dir/results/linear_results/"),
-                   gears = load_results("/tmp/working_dir/results/gears_results/"), 
-                   scGPT = load_results("/tmp/working_dir/results/sgpt_results/"), 
-                   .id = "method")
-
-highest_expr_genes <- ground_truth %>%
-  filter(perturbation == "ctrl") %>%
-  slice_max(truth, n = 1000) %>%
-  select(gene, baseline = truth)
-
-res <- inner_join(preds, ground_truth, by = c("gene", "perturbation")) %>%
-  inner_join(highest_expr_genes, by = "gene") %>%
-  summarize(dist = sqrt(sum((truth - prediction)^2)), 
-            pearson_delta = cor(prediction - baseline, truth - baseline), 
-            .by = c("perturbation", "method")) 
-
-res %>%
-  inner_join(test_train, by = "perturbation") %>%
-  filter( train != "train") %>%
-  ggplot(aes(x = method, y = dist)) +
-    ggbeeswarm::geom_quasirandom()
+```shell
+python3 src/run_plot_single_comparison.py \
+    --test_train_config_id seed_1_adamson_split \
+    --working_dir output/working_dir
 ```
 
 

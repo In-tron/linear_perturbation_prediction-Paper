@@ -1,420 +1,240 @@
 import argparse
-import os
-import sys
 import json
 import shutil
+import tempfile
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
-import scanpy as sc
+from sklearn.decomposition import TruncatedSVD
 import anndata as ad
-from scipy import sparse
-from sklearn.decomposition import PCA
-from sklearn.linear_model import Ridge
-from sklearn.preprocessing import StandardScaler
+import session_info
 
-# ------------------------------------------------------------------------------
-# 1. Argument Parsing
-# ------------------------------------------------------------------------------
+# --- Args -------------------------------------------------------------------
+
 parser = argparse.ArgumentParser(description="Run linear pretrained model")
-parser.add_argument("--dataset_name", type=str, help="The name of the dataset")
-parser.add_argument("--test_train_config_id", type=str, help="The ID of the test/train/holdout run")
-parser.add_argument("--pca_dim", type=int, default=10, help="The number of PCA dimensions")
-parser.add_argument("--ridge_penalty", type=float, default=0.1, help="The ridge penalty")
-parser.add_argument("--seed", type=int, default=1, help="The seed")
-parser.add_argument("--gene_embedding", type=str, default="training_data", 
-                    help="Path to tsv with gene embedding or 'training_data'")
-parser.add_argument("--pert_embedding", type=str, default="training_data", 
-                    help="Path to tsv with perturbation embedding or 'training_data'")
-parser.add_argument("--working_dir", type=str, help="Directory containing params, results, scripts etc.")
-parser.add_argument("--result_id", type=str, help="The result_id")
-
+parser.add_argument("--dataset_name", required=True, type=str)
+parser.add_argument("--test_train_config_id", required=True, type=str)
+parser.add_argument("--pca_dim", default=10, type=int)
+parser.add_argument("--ridge_penalty", default=0.1, type=float)
+parser.add_argument("--seed", default=1, type=int)
+parser.add_argument("--gene_embedding", default="training_data", type=str)
+parser.add_argument("--pert_embedding", default="training_data", type=str)
+parser.add_argument("--working_dir", required=True, type=str)
+parser.add_argument("--result_id", required=True, type=str)
 args = parser.parse_args()
-
-# Print arguments to verify
 print(args)
 
-# Set seed
 np.random.seed(args.seed)
 
-# Define Output Directory
-out_dir = os.path.join(args.working_dir, "results", args.result_id)
+out_dir = Path(args.working_dir) / "results" / args.result_id
+out_dir.mkdir(parents=True, exist_ok=True)
+data_dir = Path(args.working_dir) / "results" / args.test_train_config_id
+# data_dir.mkdir(parents=True, exist_ok=True) # No need to create data_dir since it should already exist from the split step
 
-# ------------------------------------------------------------------------------
-# 2. Helper Functions
-# ------------------------------------------------------------------------------
+
+# --- Core solver ------------------------------------------------------------
 
 def solve_y_axb(Y, A=None, B=None, A_ridge=0.01, B_ridge=0.01):
+    """Solve Y ≈ A @ K @ B^T via ridge regression.
+    
+    Y: (genes, perts)
+    A: (genes, gene_dims)
+    B: (perts, pert_dims)
+    Returns K: (gene_dims, pert_dims)
     """
-    Solves for K in Y = A * K * B.T using Ridge regression logic.
-    Y: Genes x Conditions (Target change)
-    A: Genes x Dim_A (Gene Embedding)
-    B: Conditions x Dim_B (Perturbation Embedding)
-    """
-    # Ensure inputs are numpy arrays
-    Y = np.array(Y)
-    if A is not None: A = np.array(A)
-    if B is not None: B = np.array(B)
+    assert isinstance(Y, np.ndarray), "Y must be a numpy array"
+    center = Y.mean(axis=1)        # (genes,)
+    Y = Y - center[:, None]
 
-    # Center Y (Gene-wise centering)
-    center = Y.mean(axis=1, keepdims=True)
-    Y_centered = Y - center
+    def ridge_solve(M, lam):
+        """(M^T M + lam I)^{-1} M^T  →  (dims, samples)"""
+        return np.linalg.solve(M.T @ M + lam * np.eye(M.shape[1]), M.T)
 
     if A is not None and B is not None:
-        # K = (A'A + lambda*I)^-1 * A' * Y * B * (B'B + lambda*I)^-1
-        # Solve LHS: (A'A + Id) * X = A'Y -> X = (A'A...)^-1 A'Y
-        
-        # Part 1: Left projection (Gene side)
-        # We calculate (A.T @ A + Ridge) ^ -1 @ A.T @ Y
-        # Using linalg.solve is more stable than explicit inverse
-        AtA = A.T @ A
-        reg_A = A_ridge * np.eye(AtA.shape[0])
-        inv_part_A = np.linalg.solve(AtA + reg_A, A.T)
-        
-        # Part 2: Right projection (Perturbation side)
-        # We need Y @ B @ (B.T @ B + Ridge)^-1
-        BtB = B.T @ B
-        reg_B = B_ridge * np.eye(BtB.shape[0])
-        # Solve (BtB + Reg) * Z = B.T  => Z = (BtB...)^-1 B.T
-        # Then transpose to get B (...) ^ -1
-        inv_part_B = np.linalg.solve(BtB + reg_B, B.T).T 
-        
-        # Combine: LHS * Y * RHS
-        K = inv_part_A @ Y_centered @ inv_part_B
-        
+        # K = (A^T A + lam I)^{-1} A^T Y B (B^T B + lam I)^{-1}
+        K = ridge_solve(A, A_ridge) @ Y @ B @ np.linalg.solve(
+            B.T @ B + B_ridge * np.eye(B.shape[1]), np.eye(B.shape[1])
+        )
     elif B is None:
-        # Standard Ridge: Y = A * K
-        AtA = A.T @ A
-        reg_A = A_ridge * np.eye(AtA.shape[0])
-        K = np.linalg.solve(AtA + reg_A, A.T @ Y_centered)
-        
+        K = ridge_solve(A, A_ridge) @ Y
     elif A is None:
-        # Y = K * B.T  => Y.T = B * K.T
-        BtB = B.T @ B
-        reg_B = B_ridge * np.eye(BtB.shape[0])
-        K = (Y_centered @ np.linalg.solve(BtB + reg_B, B.T).T)
+        K = Y @ B @ np.linalg.solve(
+            B.T @ B + B_ridge * np.eye(B.shape[1]), np.eye(B.shape[1])
+        )
     else:
-        raise ValueError("Either A or B must be non-null")
+        raise ValueError("At least one of A or B must be non-None")
 
-    # Handle NAs if any (simulating R's behavior)
     K = np.nan_to_num(K)
-    
-    return {"K": K, "center": center}
+    return K, center
 
-# ------------------------------------------------------------------------------
-# 3. Load and Preprocess Data
-# ------------------------------------------------------------------------------
 
-folder = "data/gears_pert_data"
-h5ad_path = os.path.join(folder, args.dataset_name, "perturb_processed.h5ad")
-adata = sc.read_h5ad(h5ad_path)
+# --- Load data --------------------------------------------------------------
 
-# Load config
-config_path = os.path.join(args.working_dir, "results", args.test_train_config_id)
-with open(config_path, 'r') as f:
+folder = Path("data/gears_pert_data")
+adata = ad.read_h5ad(folder / args.dataset_name / "perturb_processed.h5ad")
+
+with open(Path(args.working_dir) / "results" / args.test_train_config_id) as f:
     set2condition = json.load(f)
 
-# Ensure 'ctrl' is in training
 if "ctrl" not in set2condition["train"]:
     set2condition["train"].append("ctrl")
 
-# Create a flat list of all valid conditions
-valid_conditions = set()
-for k in set2condition:
-    valid_conditions.update(set2condition[k])
+all_conditions = {c for conds in set2condition.values() for c in conds}
+adata = adata[adata.obs["condition"].isin(all_conditions)].copy()
+adata.obs["condition"] = adata.obs["condition"].astype("category").cat.remove_unused_categories()
+adata.obs["clean_condition"] = adata.obs["condition"].str.replace(r"\+ctrl$", "", regex=True)
 
-# Filter adata
-adata = adata[adata.obs['condition'].isin(valid_conditions)].copy()
+training_map = {cond: split for split, conds in set2condition.items() for cond in conds}
+adata.obs["training"] = adata.obs["condition"].map(training_map)
 
-# Clean conditions
-adata.obs['clean_condition'] = adata.obs['condition'].astype(str).str.replace(r"\+ctrl", "", regex=True)
+gene_names = adata.var["gene_name"].values
+adata.var_names = gene_names
 
-# Map conditions to training split
-# Create a mapping dictionary: condition -> training_split
-cond_to_split = {}
-for split, conds in set2condition.items():
-    for c in conds:
-        cond_to_split[c] = split
+# AnnData X is (cells, genes)
+X = adata.X if isinstance(adata.X, np.ndarray) else adata.X.toarray()  # (cells, genes)
+baseline = X[adata.obs["condition"] == "ctrl", :].mean(axis=0)          # (genes,)
 
-adata.obs['training'] = adata.obs['condition'].map(cond_to_split)
 
-# Identify gene names
-gene_names = adata.var_names
-# (R script sets rownames(sce) <- gene_names, which is standard in AnnData)
+# --- Pseudobulk -------------------------------------------------------------
 
-# Calculate Baseline (Mean of control)
-ctrl_mask = adata.obs['condition'] == 'ctrl'
-if sparse.issparse(adata.X):
-    baseline = np.array(adata.X[ctrl_mask].mean(axis=0)).flatten()
-else:
-    baseline = np.mean(adata.X[ctrl_mask], axis=0)
+def pseudobulk(adata, X, group_cols):
+    """Average expression per group. Returns pb_X: (groups, genes)."""
+    groups = adata.obs[group_cols].drop_duplicates().reset_index(drop=True)
+    pb_X = np.zeros((len(groups), X.shape[1]))
+    for i, row in groups.iterrows():
+        mask = np.ones(adata.n_obs, dtype=bool)
+        for col in group_cols:
+            mask &= (adata.obs[col] == row[col]).values
+        pb_X[i, :] = X[mask].mean(axis=0)
+    return pb_X, groups.reset_index(drop=True)
 
-# Pseudobulk
-# Group by condition, clean_condition, training
-# We aggregate to mean expression per condition
-pseudobulk_obs = ['condition', 'clean_condition', 'training']
-# Ensure these are strings/categories for grouping
-pb_df = adata.to_df()
-pb_df[pseudobulk_obs] = adata.obs[pseudobulk_obs].values
 
-# Groupby and mean
-psce_df = pb_df.groupby(pseudobulk_obs).mean()
-psce_meta = pb_df[pseudobulk_obs].drop_duplicates().set_index('condition')
+pb_X, pb_obs = pseudobulk(adata, X, ["condition", "clean_condition", "training"])
+pb_change = pb_X - baseline[None, :]   # (groups, genes)
 
-# Align metadata with the aggregated matrix
-psce_df = psce_df.loc[psce_meta.index] # ensure alignment
-psce_X = psce_df.values.T # Genes x Conditions (to match R's assay layout)
+train_mask = pb_obs["training"] == "train"
+train_X      = pb_X[train_mask.values, :]       # (train_perts, genes)
+train_change = pb_change[train_mask.values, :]
+train_obs    = pb_obs[train_mask].reset_index(drop=True)
 
-# Calculate "Change" (Y)
-# Y = X_pseudobulk - baseline
-Y_all = psce_X - baseline[:, None]
 
-# Get Training Data Subset
-train_mask = psce_meta['training'] == 'train'
-train_conditions = psce_meta.index[train_mask]
-Y_train = Y_all[:, train_mask] # Genes x TrainConditions
+# --- Embeddings -------------------------------------------------------------
+# Convention (matching solver):
+#   gene_emb : (genes,   gene_dims)   — A
+#   pert_emb : (perts,   pert_dims)   — B
 
-# ------------------------------------------------------------------------------
-# 4. Generate Embeddings
-# ------------------------------------------------------------------------------
+def make_gene_embedding(mode, train_X, gene_names, pca_dim):
+    """train_X: (perts, genes)  →  embedding: (genes, dims)"""
+    n_genes = train_X.shape[1]
+    if mode == "training_data":
+        svd = TruncatedSVD(n_components=pca_dim, random_state=0)
+        emb = svd.fit_transform(train_X.T)   # (genes, pca_dim)
+        return pd.DataFrame(emb, index=gene_names)
+    elif mode == "identity":
+        return pd.DataFrame(np.eye(n_genes), index=gene_names)
+    elif mode == "zero":
+        return pd.DataFrame(np.zeros((n_genes, n_genes)), index=gene_names)
+    elif mode == "random":
+        return pd.DataFrame(np.random.randn(n_genes, pca_dim), index=gene_names)
+    else:
+        df = pd.read_csv(mode, sep="\t", index_col=0)
+        return df   # expected (genes, dims)
 
-# --- Gene Embeddings (A) ---
-# Shape: Genes x pca_dim
-if args.gene_embedding == "training_data":
-    # PCA on Genes based on Training Data
-    # Y_train is Genes x Conditions. 
-    # sklearn PCA fits on (n_samples, n_features). Here Genes are observations.
-    pca_op = PCA(n_components=args.pca_dim)
-    # Fit on Genes (rows of Y_train)
-    gene_emb = pca_op.fit_transform(Y_train) 
-    gene_emb_rownames = psce_df.columns # Gene names
-    
-elif args.gene_embedding == "identity":
-    gene_emb = np.eye(Y_train.shape[0])
-    gene_emb_rownames = psce_df.columns
-elif args.gene_embedding == "zero":
-    gene_emb = np.zeros((Y_train.shape[0], Y_train.shape[0]))
-    gene_emb_rownames = psce_df.columns
-elif args.gene_embedding == "random":
-    gene_emb = np.random.normal(size=(Y_train.shape[0], args.pca_dim))
-    gene_emb_rownames = psce_df.columns
-else:
-    # Load from file
-    # Assuming tsv with index as gene names
-    df_emb = pd.read_csv(args.gene_embedding, sep="\t", index_col=0)
-    gene_emb = df_emb.values.T # Transpose based on R script logic if needed, check dims
-    # The R script does t(fread), implying the file is Pcs x Genes, so we want Genes x Pcs?
-    # R: t(PCs x Genes) -> Genes x PCs. 
-    # Python read_csv usually reads (Rows x Cols). If file is same format, just .values.
-    # We'll assume the file is (Genes x PCs) standard, or transpose if shape matches.
-    gene_emb = df_emb.values
-    gene_emb_rownames = df_emb.index
 
-# --- Perturbation Embeddings (B) ---
-# Shape: Conditions x pca_dim (We need B, the R script passes B into solver)
-if args.pert_embedding == "training_data":
-    # R script: t(pca$x). This seems to define perturbation embedding based on
-    # the expression profile of the condition.
-    # We perform PCA on the Transpose of Y_train (Conditions x Genes)
-    pca_op_pert = PCA(n_components=args.pca_dim)
-    pert_emb = pca_op_pert.fit_transform(Y_train.T) # Conditions x PCs
-    pert_emb_colnames = train_conditions # Condition names
-    
-elif args.pert_embedding == "identity":
-    pert_emb = np.eye(Y_all.shape[1])
-    pert_emb_colnames = psce_meta['clean_condition'].values
-elif args.pert_embedding == "zero":
-    pert_emb = np.zeros((Y_all.shape[1], Y_all.shape[1]))
-    pert_emb_colnames = psce_meta['clean_condition'].values
-elif args.pert_embedding == "random":
-    # Random embedding for all conditions in psce
-    # R script generates random for ncol(psce)
-    pert_emb = np.random.normal(size=(Y_all.shape[1], args.pca_dim)) 
-    pert_emb_colnames = psce_meta['clean_condition'].values
-else:
-    df_pert = pd.read_csv(args.pert_embedding, sep="\t", index_col=0)
-    pert_emb = df_pert.values # Conditions x PCs
-    pert_emb_colnames = df_pert.index
+def make_pert_embedding(mode, train_X, clean_conditions, pca_dim):
+    """train_X: (perts, genes)  →  embedding: (perts, dims)"""
+    n_perts = train_X.shape[0]
+    if mode == "training_data":
+        svd = TruncatedSVD(n_components=pca_dim, random_state=0)
+        emb = svd.fit_transform(train_X)     # (perts, pca_dim)
+        return pd.DataFrame(emb, index=clean_conditions)
+    elif mode == "identity":
+        return pd.DataFrame(np.eye(n_perts), index=clean_conditions)
+    elif mode == "zero":
+        return pd.DataFrame(np.zeros((n_perts, n_perts)), index=clean_conditions)
+    elif mode == "random":
+        return pd.DataFrame(np.random.randn(n_perts, pca_dim), index=clean_conditions)
+    else:
+        df = pd.read_csv(mode, sep="\t", index_col=0)
+        return df   # expected (perts, dims)
 
-# Handle "ctrl" column requirement for external embeddings
-# (If pert_emb is a dataframe from file, ensure ctrl exists)
-if isinstance(pert_emb, pd.DataFrame) or (args.pert_embedding not in ["training_data", "identity", "zero", "random"]):
-     # Logic to add zero row for ctrl if missing would go here, 
-     # but for matrices (numpy) we rely on index matching below.
-     pass
 
-# ------------------------------------------------------------------------------
-# 5. Matching and Alignment
-# ------------------------------------------------------------------------------
+gene_emb = make_gene_embedding(args.gene_embedding, train_X, gene_names, args.pca_dim)
+pert_emb = make_pert_embedding(args.pert_embedding, train_X, train_obs["clean_condition"].values, args.pca_dim)
 
-# We need to subset Y, A, and B so dimensions match for the solver
-# Y subset: Genes in gene_emb AND Conditions in pert_emb (subset to training)
+if "ctrl" not in pert_emb.index:
+    pert_emb.loc["ctrl"] = 0.0
 
-# 1. Match Genes
-common_genes = np.intersect1d(gene_emb_rownames, psce_df.columns)
-if len(common_genes) <= 1:
+# Match embeddings to training data
+gene_match_mask = gene_emb.index.isin(gene_names)
+pert_match_mask = pert_emb.index.isin(train_obs["clean_condition"])
+
+if pert_match_mask.sum() <= 1:
+    raise ValueError("Too few matches between clean_conditions and pert_embedding")
+if gene_match_mask.sum() <= 1:
     raise ValueError("Too few matches between gene names and gene_embedding")
 
-gene_indices_Y = [psce_df.columns.get_loc(g) for g in common_genes]
-gene_indices_A = [list(gene_emb_rownames).index(g) for g in common_genes]
+gene_emb_sub = gene_emb.loc[gene_match_mask].values   # (matched_genes, gene_dims)
+pert_emb_sub = pert_emb.loc[pert_match_mask].values   # (matched_perts, pert_dims)
 
-Y_sub_genes = Y_train[gene_indices_Y, :]
-A_sub = gene_emb[gene_indices_A, :]
+matched_genes = gene_emb.index[gene_match_mask]
+matched_perts = pert_emb.index[pert_match_mask]
 
-# 2. Match Conditions (Perturbations)
-# Note: In "training_data" mode, pert_emb was derived from Y_train, so it matches perfectly.
-# In other modes, we need to match names.
-clean_conds_train = psce_meta.loc[train_conditions, 'clean_condition'].values
+gene_idx = [list(gene_names).index(g) for g in matched_genes]
+pert_idx  = [list(train_obs["clean_condition"]).index(p) for p in matched_perts]
 
-# Find intersection between training conditions and available perturbation embeddings
-common_conds_train = np.intersect1d(clean_conds_train, pert_emb_colnames)
+# Y: (matched_genes, matched_perts)
+Y = train_change[np.ix_(pert_idx, gene_idx)].T
 
-if len(common_conds_train) <= 1:
-     raise ValueError("Too few matches between clean_conditions and pert_embedding")
 
-# Indices in Y_sub_genes (which is currently Genes x AllTrainConditions)
-# We need to map clean_cond names back to the specific integer indices in Y_train
-cond_indices_Y = []
-cond_indices_B = []
+# --- Fit model --------------------------------------------------------------
 
-# This loop ensures order is preserved
-for c in common_conds_train:
-    # Get index in Y_train (via train_conditions list which corresponds to columns)
-    # Note: there might be multiple if duplicates exist, but pseudobulk is usually unique per cond
-    # Assuming unique condition names in pseudobulk
-    idx_y = np.where(clean_conds_train == c)[0][0] 
-    cond_indices_Y.append(idx_y)
-    
-    # Get index in pert_emb
-    idx_b = np.where(pert_emb_colnames == c)[0][0]
-    cond_indices_B.append(idx_b)
+K, center = solve_y_axb(Y, A=gene_emb_sub, B=pert_emb_sub,
+                         A_ridge=args.ridge_penalty, B_ridge=args.ridge_penalty)
 
-Y_final = Y_sub_genes[:, cond_indices_Y]
-B_training = pert_emb[cond_indices_B, :]
+# Predict for all conditions: pred = A K B^T + center + baseline
+# gene_emb_sub: (matched_genes, gene_dims)
+# K:            (gene_dims, pert_dims)
+# pert_emb_all: (all_perts, pert_dims)
+all_clean_conds = pb_obs["clean_condition"].values
+pert_emb_all = pert_emb.reindex(all_clean_conds, fill_value=0.0).values  # (all_perts, pert_dims)
 
-# ------------------------------------------------------------------------------
-# 6. Solve Model
-# ------------------------------------------------------------------------------
+baseline_sub = baseline[gene_idx]                                          # (matched_genes,)
+# pred: (matched_genes, all_perts)
+pred = gene_emb_sub @ K @ pert_emb_all.T + center[:, None] + baseline_sub[:, None]
 
-# Solve Y = A * K * B.T
-# Note: pert_emb is usually (Conditions x PCs).
-# The function expects B such that Y ~ A K B.T.
-# If B_training is (N_conds x PCs), then B.T is (PCs x N_conds).
-# Dimensions: (G x C) = (G x D1) * (D1 x D2) * (D2 x C).
-# This matches.
 
-solution = solve_y_axb(Y=Y_final, A=A_sub, B=B_training,
-                       A_ridge=args.ridge_penalty, B_ridge=args.ridge_penalty)
-K = solution['K']
-center = solution['center']
+# --- Summary statistics -----------------------------------------------------
 
-# ------------------------------------------------------------------------------
-# 7. Prediction
-# ------------------------------------------------------------------------------
+# obs_change / pred_change both: (matched_genes, all_perts)
+obs_change  = pb_change[np.ix_(range(len(pb_obs)), gene_idx)].T  # (matched_genes, all_perts)
+pred_change = pred - baseline_sub[:, None]
 
-# Prepare B_all (Perturbation embedding for ALL conditions in the dataset)
-# We map psce_meta['clean_condition'] to the embedding rows
-pert_matches_all = []
-valid_indices_all = []
+r2_rows = []
+for i, (cond, split) in enumerate(zip(all_clean_conds, pb_obs["training"])):
+    obs_i, pred_i = obs_change[:, i], pred_change[:, i]
+    valid = ~(np.isnan(obs_i) | np.isnan(pred_i))
+    if valid.sum() > 1:
+        r2 = np.corrcoef(obs_i[valid], pred_i[valid])[0, 1]
+        r2_rows.append({"cond": cond, "training": split, "r2": r2})
 
-all_clean_conds = psce_meta['clean_condition'].values
-for i, c in enumerate(all_clean_conds):
-    if c in pert_emb_colnames:
-        idx_b = np.where(pert_emb_colnames == c)[0][0]
-        pert_matches_all.append(pert_emb[idx_b, :])
-        valid_indices_all.append(i)
-    else:
-        # Handle missing (e.g., zero fill or skip) - R script implies 0 if missing for ctrl
-        if c == "ctrl":
-            pert_matches_all.append(np.zeros(pert_emb.shape[1]))
-            valid_indices_all.append(i)
-        else:
-            # If missing and not ctrl, we might just put zeros or fail. 
-            # R script uses `match` which returns NA, then `na.omit` logic might drop them.
-            # We will use zeros for missing perturbations to keep shape
-            pert_matches_all.append(np.zeros(pert_emb.shape[1]))
-            valid_indices_all.append(i)
+r2_df = pd.DataFrame(r2_rows)
+print(r2_df.groupby("training")["r2"].describe())
 
-B_all = np.array(pert_matches_all) # Conditions x PCs
 
-# Baseline needs to be matched to the gene subset used
-baseline_sub = baseline[gene_indices_Y]
+# --- Save output ------------------------------------------------------------
 
-# Pred = A * K * B_all.T + center + baseline
-# Shapes: (G x D1) @ (D1 x D2) @ (D2 x C_all) -> (G x C_all)
-pred = (A_sub @ K @ B_all.T) + center + baseline_sub[:, None]
+tmp_out_dir = Path(tempfile.mkdtemp()) / "prediction_storage"
+tmp_out_dir.mkdir(parents=True)
 
-# ------------------------------------------------------------------------------
-# 8. Evaluation & Summary
-# ------------------------------------------------------------------------------
+pred_dict = {cond: pred[:, i].tolist() for i, cond in enumerate(all_clean_conds)}
+(tmp_out_dir / "all_predictions.json").write_text(json.dumps(pred_dict))
+(tmp_out_dir / "gene_names.json").write_text(json.dumps(list(matched_genes)))
 
-# Calculate correlations (R2 in the R script context, but functionally Pearson)
-# Observed change
-obs = Y_all[gene_indices_Y, :] # Filtered genes, all conditions
-# Note: obs is (Genes x Conditions), pred is (Genes x Conditions)
+if out_dir.exists():
+    shutil.rmtree(out_dir)
+shutil.move(str(tmp_out_dir), str(out_dir))
 
-corrs = []
-conditions_out = psce_meta.index
-training_out = psce_meta['training']
-
-print("Summary Statistics:")
-for i in range(pred.shape[1]):
-    # Flatten arrays for correlation
-    p_vec = pred[:, i]
-    o_vec = obs[:, i] + baseline_sub # Reconstruct raw expression or use change
-    # R script compares `obs` (change) vs `pred - baseline` (change predicted)
-    # Actually R script summary:
-    # obs = assay(psce, "change")
-    # pred = pred - baseline
-    # It correlates the DELTAS.
-    
-    o_delta = obs[:, i] # This is already centered/change
-    p_delta = pred[:, i] - baseline_sub
-    
-    if np.std(o_delta) == 0 or np.std(p_delta) == 0:
-        r = 0
-    else:
-        r = np.corrcoef(o_delta, p_delta)[0, 1]
-    
-    corrs.append({
-        "cond": conditions_out[i],
-        "training": training_out[i],
-        "r2": r
-    })
-
-df_res = pd.DataFrame(corrs)
-print(df_res.groupby("training")['r2'].describe())
-
-# ------------------------------------------------------------------------------
-# 9. Save Results
-# ------------------------------------------------------------------------------
-
-# Format: JSON of dict(gene -> list of values? or list of dicts?)
-# R script: as.list(as.data.frame(pred)) -> Column-oriented JSON (keys are Conditions)
-# Pred matrix has Genes as Rows, Conditions as Columns.
-# as.data.frame(pred) makes columns = conditions.
-# as.list creates { "Cond1": [val1, val2...], "Cond2": ... }
-
-pred_df = pd.DataFrame(pred, index=common_genes, columns=conditions_out)
-output_dict = pred_df.to_dict(orient='list')
-
-# Gene names list
-output_genes = list(common_genes)
-
-# Save to temp
-tmp_dir = os.path.join(tempfile.gettempdir(), "prediction_storage")
-os.makedirs(tmp_dir, exist_ok=True)
-
-with open(os.path.join(tmp_dir, "all_predictions.json"), 'w') as f:
-    json.dump(output_dict, f)
-
-with open(os.path.join(tmp_dir, "gene_names.json"), 'w') as f:
-    json.dump(output_genes, f)
-
-# Move to final location
-if not os.path.exists(out_dir):
-    os.makedirs(out_dir)
-
-shutil.move(os.path.join(tmp_dir, "all_predictions.json"), os.path.join(out_dir, "all_predictions.json"))
-shutil.move(os.path.join(tmp_dir, "gene_names.json"), os.path.join(out_dir, "gene_names.json"))
-
-print(f"Done. Results saved to {out_dir}")
+session_info.show()
+print("Python done")

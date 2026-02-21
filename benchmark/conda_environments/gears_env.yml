@@ -1,4 +1,4 @@
-name: gears_env2
+name: gears_env
 channels:
   - bioconda
   - conda-forge
