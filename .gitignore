@@ -1,12 +1,12 @@
 # Ignore RStudio project files and session data
-.Rproj
-.Rhistory
-.RData
-.Ruserdata
+# .Rproj
+# .Rhistory
+# .RData
+# .Ruserdata
 
-# Ignore .DS_Store files (macOS)
-.DS_Store
-**/.DS_Store
+# # Ignore .DS_Store files (macOS)
+# .DS_Store
+# **/.DS_Store
 
 # Ignore benchmark/output
 benchmark/output/*
