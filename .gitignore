@@ -9,8 +9,5 @@
 # Ignore benchmark/output with exceptions (as some files are big)
 benchmark/output/*
 
-# Ignore tikzDictionary
-*tikzDictionary
-
 # Ignore data/
-data/*
+benchmark/data/*
